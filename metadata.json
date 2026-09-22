@@ -1,0 +1,6 @@
+{
+  "name": "AI Laptop Review",
+  "description": "Turns YouTube laptop review videos into structured, comparable laptop data with human-in-the-loop review and Supabase persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
