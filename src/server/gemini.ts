@@ -1,6 +1,7 @@
 import { GoogleGenAI } from '@google/genai';
 import { ExtractionData, ExtractionJob } from '../types.ts';
 import { checkDuplicateReview, saveExtractionJob } from './db.ts';
+import { normalizeExtractionInput } from './schema.ts';
 
 // Extract YouTube video ID from various URL formats
 export function extractYouTubeVideoId(url: string): string | null {
@@ -239,7 +240,7 @@ function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Background extraction worker
+// Background extraction worker using Quota-Aware Exhaustive Multi-Pass Pipeline
 export async function runExtractionBackground(job: ExtractionJob, language?: string): Promise<void> {
   console.log(`[ExtractJob] Starting background extraction for ${job.id} (${job.youtube_url})`);
 
@@ -266,130 +267,36 @@ export async function runExtractionBackground(job: ExtractionJob, language?: str
     return;
   }
 
-  const ai = new GoogleGenAI({
-    apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
-    },
-  });
+  const model = process.env.GEMINI_MODEL || 'gemini-3.7-flash';
+  const canonicalUrl = job.youtube_video_id ? `https://www.youtube.com/watch?v=${job.youtube_video_id}` : job.youtube_url;
 
-  let extractedData: ExtractionData | null = null;
-  let lastError: any = null;
+  try {
+    const { extractLaptopDataWithGemini } = await import('./external/gemini.ts');
+    
+    // Pass existing raw_extraction if present to resume completed passes
+    const result = await extractLaptopDataWithGemini(
+      canonicalUrl,
+      job.youtube_video_id,
+      model,
+      job.raw_extraction as any
+    );
 
-  // Multi-model fallback cascade with retry/backoff
-  for (const modelName of MODELS_CASCADE) {
-    console.log(`[ExtractJob] Attempting model: ${modelName}`);
-
-    // Try up to 2 attempts per model for transient errors (429/503)
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const languageInstruction = language ? `\nAnalyze the spoken language and on-screen text in ${language} where appropriate.\n` : '';
-        const finalPrompt = `Analyze the provided laptop review YouTube video and extract all technical specifications, benchmark results, gaming FPS scores, thermal readings, display measurements, battery runtimes, pros, cons, and verdict:\n\n` +
-                            languageInstruction +
-                            EXTRACTION_PROMPT;
-
-        const canonicalUrl = job.youtube_video_id ? `https://www.youtube.com/watch?v=${job.youtube_video_id}` : job.youtube_url;
-        console.log(`[ExtractJob] Sending YouTube URL as Gemini video fileData input: ${canonicalUrl}`);
-        const response = await ai.models.generateContent({
-          model: modelName,
-          contents: [
-            {
-              fileData: {
-                fileUri: canonicalUrl,
-              },
-            },
-            {
-              text: finalPrompt,
-            },
-          ],
-          config: {
-            responseMimeType: 'application/json',
-          },
-        });
-
-        const rawText = response.text || '';
-        if (!rawText.trim()) {
-          throw new Error('Gemini returned an empty response.');
-        }
-
-        // JSON repair step
-        const repaired = repairJsonString(rawText);
-        const parsed = JSON.parse(repaired) as ExtractionData;
-
-        // Basic sanity validation
-        if (!parsed.laptop || !parsed.configuration || !parsed.review_meta) {
-          throw new Error('Extracted JSON is missing core top-level keys.');
-        }
-        
-        // Identity validation
-        const brand = (parsed.laptop.brand || '').trim().toLowerCase();
-        const model = (parsed.laptop.model || '').trim().toLowerCase();
-
-        if (!brand || !model) {
-          throw new Error('Identity Validation Failed: Missing laptop brand or model.');
-        }
-
-        const genericPhrases = ['the laptop', 'this laptop', 'unknown', 'n/a', 'unspecified', 'generic', 'laptop'];
-        if (genericPhrases.includes(brand) || genericPhrases.includes(model)) {
-          throw new Error(`Identity Validation Failed: Generic laptop name detected ('${parsed.laptop.brand}' / '${parsed.laptop.model}').`);
-        }
-
-        console.log(`[ExtractJob] Gemini returned laptop: ${parsed.laptop.brand} ${parsed.laptop.model}`);
-        console.log(`[ExtractJob] Extraction identity validation: PASS`);
-
-        // Ensure arrays are initialized
-        parsed.benchmarks = Array.isArray(parsed.benchmarks) ? parsed.benchmarks : [];
-        parsed.gaming = Array.isArray(parsed.gaming) ? parsed.gaming : [];
-        parsed.thermals = Array.isArray(parsed.thermals) ? parsed.thermals : [];
-        parsed.review_meta.verdict_pros = Array.isArray(parsed.review_meta.verdict_pros) ? parsed.review_meta.verdict_pros : [];
-        parsed.review_meta.verdict_cons = Array.isArray(parsed.review_meta.verdict_cons) ? parsed.review_meta.verdict_cons : [];
-
-        extractedData = parsed;
-        break; // Success! Break retry loop
-      } catch (err: any) {
-        lastError = err;
-        const errMsg = err?.message || String(err);
-        console.warn(`[ExtractJob] Model ${modelName} (attempt ${attempt}) error: ${errMsg}`);
-
-        // Check if 429 or 503 error for retry backoff
-        const isTransient = errMsg.includes('429') || errMsg.includes('503') || errMsg.includes('UNAVAILABLE') || errMsg.includes('RESOURCE_EXHAUSTED');
-        if (isTransient && attempt < 3) {
-          let delayMs = 5000;
-          const retryMatch = errMsg.match(/retry in ([0-9.]+)s/i) || errMsg.match(/retryDelay"?:\s*"([0-9.]+)s"/i);
-          if (retryMatch && retryMatch[1]) {
-            const parsedSec = parseFloat(retryMatch[1]);
-            if (!isNaN(parsedSec) && parsedSec > 0 && parsedSec <= 65) {
-              delayMs = Math.ceil(parsedSec * 1000) + 1500;
-            }
-          }
-          console.log(`[ExtractJob] Transient rate-limit on ${modelName}. Backing off ${delayMs}ms before attempt ${attempt + 1}...`);
-          await wait(delayMs);
-        } else {
-          // Move to next model
-          break;
-        }
-      }
-    }
-
-    if (extractedData) {
-      break; // Success! Break cascade loop
-    }
-  }
-
-  if (extractedData) {
-    // Persist raw Gemini JSON into extraction_jobs.raw_extraction the moment it's parsed
-    job.raw_extraction = extractedData;
+    job.raw_extraction = result.payload as any;
     job.status = 'ready_for_review';
     job.error_message = null;
     await saveExtractionJob(job);
-    console.log(`[ExtractJob] Successfully extracted data for job ${job.id}. Ready for human review.`);
-  } else {
-    const errorString = lastError?.message || 'Failed to extract video details across models';
-    console.error(`[ExtractJob] Extraction failed for job ${job.id}:`, errorString);
+    console.log(`[ExtractJob] Successfully completed extraction for job ${job.id}. Ready for human review.`);
+  } catch (err: any) {
+    const rawError = err?.message || String(err);
+    console.error(`[ExtractJob] Extraction error for job ${job.id}:`, rawError);
+
+    // If partial extraction payload exists on error, preserve it!
+    if (err?.partialPayload) {
+      job.raw_extraction = err.partialPayload;
+    }
+
     job.status = 'failed';
-    job.error_message = errorString;
+    job.error_message = rawError.slice(0, 300);
     await saveExtractionJob(job);
   }
 }

@@ -13,11 +13,21 @@ import {
 } from 'lucide-react';
 import { ExtractionJob } from '../types.ts';
 import { trackedFetch } from '../utils/trackedFetch.ts';
+import { getStoredAdminKey, getStoredAuthToken } from '../client/lib/api.ts';
 
 interface JobsModalProps {
   isOpen: boolean;
   onClose: () => void;
   onResumeReview: (jobId: string, rawData: any) => void;
+}
+
+function getAuthHeaders(): HeadersInit {
+  const headers: Record<string, string> = {};
+  const token = getStoredAuthToken();
+  if (token) headers['Authorization'] = `Bearer ${token}`;
+  const adminKey = getStoredAdminKey();
+  if (adminKey) headers['x-admin-key'] = adminKey;
+  return headers;
 }
 
 export const JobsModal: React.FC<JobsModalProps> = ({
@@ -29,6 +39,7 @@ export const JobsModal: React.FC<JobsModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [isClearing, setIsClearing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!isOpen) return;
@@ -37,13 +48,27 @@ export const JobsModal: React.FC<JobsModalProps> = ({
     async function loadJobs() {
       try {
         setLoading(true);
-        const res = await trackedFetch('/api/jobs');
+        setError(null);
+        const res = await trackedFetch('/api/jobs', {
+          headers: getAuthHeaders(),
+        });
         if (res.ok) {
-          const data: ExtractionJob[] = await res.json();
-          if (isMounted) setJobs(data);
+          const data = await res.json();
+          const list: ExtractionJob[] = Array.isArray(data)
+            ? data
+            : Array.isArray(data?.jobs)
+            ? data.jobs
+            : [];
+          if (isMounted) setJobs(list);
+        } else {
+          const errData = await res.json().catch(() => null);
+          if (isMounted) {
+            setError(errData?.error?.message || `Failed to load extraction jobs (${res.status})`);
+          }
         }
-      } catch (err) {
+      } catch (err: any) {
         console.warn('Failed to load extraction jobs:', err);
+        if (isMounted) setError(err?.message || 'Failed to load extraction jobs');
       } finally {
         if (isMounted) setLoading(false);
       }
@@ -57,28 +82,44 @@ export const JobsModal: React.FC<JobsModalProps> = ({
 
   const handleDeleteJob = async (jobId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    setError(null);
     try {
       setDeletingId(jobId);
-      const res = await trackedFetch(`/api/jobs/${jobId}`, { method: 'DELETE' });
+      const res = await trackedFetch(`/api/jobs/${jobId}`, {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      });
       if (res.ok) {
         setJobs((prev) => prev.filter((j) => j.id !== jobId));
+      } else {
+        const errData = await res.json().catch(() => null);
+        setError(errData?.error?.message || `Failed to delete job ${jobId.slice(0, 8)} (${res.status})`);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to delete extraction job:', err);
+      setError(err?.message || 'Network error deleting job');
     } finally {
       setDeletingId(null);
     }
   };
 
   const handleClearAll = async () => {
+    setError(null);
     try {
       setIsClearing(true);
-      const res = await trackedFetch('/api/jobs', { method: 'DELETE' });
+      const res = await trackedFetch('/api/jobs', {
+        method: 'DELETE',
+        headers: getAuthHeaders(),
+      });
       if (res.ok) {
         setJobs([]);
+      } else {
+        const errData = await res.json().catch(() => null);
+        setError(errData?.error?.message || `Failed to clear extraction jobs (${res.status})`);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to clear extraction jobs:', err);
+      setError(err?.message || 'Network error clearing jobs');
     } finally {
       setIsClearing(false);
     }
@@ -116,6 +157,21 @@ export const JobsModal: React.FC<JobsModalProps> = ({
             </button>
           </div>
         </div>
+
+        {error && (
+          <div className="p-3 bg-red-50 border-2 border-red-600 text-red-800 text-xs flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <AlertTriangle className="w-4 h-4 shrink-0 text-red-600" />
+              <span>{error}</span>
+            </div>
+            <button
+              onClick={() => setError(null)}
+              className="text-red-700 font-bold hover:underline ml-2 text-[10px] uppercase cursor-pointer"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
 
         <p className="text-xs text-gray-600">
           History of video extraction jobs processed by the Gemini extraction worker. These records track extraction status and do not modify saved laptop data.

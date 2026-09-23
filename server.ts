@@ -3,8 +3,10 @@ import path from 'path';
 import dotenv from 'dotenv';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
-import apiRoutes from './src/server/routes.ts';
-import { testSupabaseConnection } from './src/server/supabase.ts';
+import apiRoutes from './src/server/routes/index.ts';
+import { requestIdMiddleware, apiErrorHandler } from './src/server/middleware/observability.ts';
+import { recoverStaleJobs } from './src/server/repositories/jobsRepository.ts';
+import { isSupabaseConfigured } from './src/server/external/supabase.ts';
 
 dotenv.config();
 
@@ -15,15 +17,21 @@ async function startServer() {
   // Trust reverse proxy (Cloud Run / Nginx) for accurate client IP resolution
   app.set('trust proxy', 1);
 
-  // Security Headers
-  app.use(helmet({
-    contentSecurityPolicy: false, // Vite Dev needs script eval/inline styles
-  }));
+  // Request ID and structured request logger
+  app.use(requestIdMiddleware);
 
-  // Global Rate Limiting
+  // Security Headers
+  app.use(
+    helmet({
+      contentSecurityPolicy: false, // Vite dev needs inline scripts/styles
+      crossOriginEmbedderPolicy: false,
+    })
+  );
+
+  // Global Rate Limiter: 600 requests per 15 min per IP
   const globalLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 500, // limit each IP to 500 requests per windowMs
+    windowMs: 15 * 60 * 1000,
+    max: 600,
     standardHeaders: true,
     legacyHeaders: false,
     validate: {
@@ -31,20 +39,36 @@ async function startServer() {
       forwardedHeader: false,
       default: false,
     },
-    message: { error: 'Too many requests, please try again later.' }
+    message: {
+      error: {
+        code: 'RATE_LIMITED',
+        message: 'Too many requests from this IP, please try again shortly.',
+      },
+    },
   });
-  app.use(globalLimiter);
+  app.use('/api', globalLimiter);
 
-  // JSON request body parser with strict limits
-  app.use(express.json({ limit: '2mb' })); // Strict 2MB limit for reviewed JSON
+  // JSON request body parser with strict 3MB limit
+  app.use(express.json({ limit: '3mb' }));
 
   // API Routes
   app.use('/api', apiRoutes);
 
-  // Health check
-  app.get('/api/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
-  });
+  // Global API error handler
+  app.use(apiErrorHandler);
+
+  // Recover any stale extraction jobs on startup if Supabase is connected
+  if (isSupabaseConfigured()) {
+    recoverStaleJobs()
+      .then(count => {
+        if (count > 0) {
+          console.log(`[JobRecovery] Successfully recovered ${count} interrupted jobs.`);
+        }
+      })
+      .catch(err => {
+        console.warn('[JobRecovery] Notice: Job recovery check encountered error (database may not be seeded yet):', err.message);
+      });
+  }
 
   // Vite middleware for development vs static serve for production
   if (process.env.NODE_ENV !== 'production') {
@@ -57,25 +81,17 @@ async function startServer() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  app.listen(PORT, '0.0.0.0', async () => {
-    console.log(`[AI Laptop Review] Server running on http://0.0.0.0:${PORT}`);
-    const hasUrl = Boolean(process.env.SUPABASE_URL?.trim());
-    const hasKey = Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY?.trim());
-    console.log(`[Supabase] Environment check: URL=${hasUrl ? 'present' : 'missing'}, KEY=${hasKey ? 'present' : 'missing'}`);
-    try {
-      const diag = await testSupabaseConnection();
-      console.log(`[Supabase] Connection test: ${diag.reachable ? 'reachable (LIVE)' : diag.status === 'configured_unreachable' ? `UNREACHABLE: ${diag.error}` : 'NOT CONFIGURED (memory fallback)'}`);
-    } catch (e: any) {
-      console.warn(`[Supabase] Diagnostic error: ${e?.message || e}`);
-    }
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[V2 Server] AI Laptop Review platform running on http://0.0.0.0:${PORT}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('[AI Laptop Review] Fatal startup error:', err);
+startServer().catch(err => {
+  console.error('[V2 Server] Fatal startup error:', err);
+  process.exit(1);
 });

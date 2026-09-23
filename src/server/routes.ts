@@ -111,6 +111,54 @@ router.get('/extract/:jobId', async (req: Request, res: Response) => {
   }
 });
 
+// POST /api/extract/:jobId/resume - Resume an incomplete/rate-limited job from its last successful pass
+router.post('/extract/:jobId/resume', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { jobId } = req.params;
+    const job = await getExtractionJob(jobId);
+    if (!job) {
+      return res.status(404).json({ error: 'Extraction job not found.' });
+    }
+
+    if (job.status === 'processing') {
+      return res.status(409).json({ error: 'Job is already processing.' });
+    }
+
+    job.status = 'pending';
+    job.error_message = null;
+    await saveExtractionJob(job);
+
+    // Trigger background resumption
+    runExtractionBackground(job).catch((err) => {
+      console.error(`[ExtractRoute] Background resumption failed for job ${jobId}:`, err);
+    });
+
+    return res.json({ success: true, jobId, status: 'pending' });
+  } catch (err: any) {
+    console.error('[ExtractRoute] Error resuming extraction:', err);
+    return res.status(500).json({ error: err.message || 'Server error' });
+  }
+});
+
+// GET /api/gemini/status - Model rate limit and scheduler status
+router.get('/gemini/status', async (req: Request, res: Response) => {
+  try {
+    const { geminiScheduler } = await import('./services/extraction/geminiScheduler.ts');
+    const model = process.env.GEMINI_MODEL || 'gemini-3.7-flash';
+    const cooldown = geminiScheduler.getModelCooldown(model);
+
+    return res.json({
+      model,
+      isRateLimited: Boolean(cooldown?.isRateLimited),
+      retryAfterSeconds: cooldown?.retryAfterSeconds || 0,
+      cooldownUntil: cooldown?.cooldownUntil || null,
+      lastError: cooldown?.lastError || null,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message || 'Server error' });
+  }
+});
+
 // STEP 2: GET /api/extract/:jobId/matches - Entity duplicate/match lookup for review screen
 router.get('/extract/:jobId/matches', async (req: Request, res: Response) => {
   try {
